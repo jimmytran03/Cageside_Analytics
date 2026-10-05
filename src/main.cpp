@@ -1,5 +1,6 @@
 #include "ufc/Backtest.hpp"
 #include "ufc/CsvLoader.hpp"
+#include "ufc/Exporter.hpp"
 #include "ufc/FightScorer.hpp"
 #include "ufc/Leaderboard.hpp"
 #include "ufc/Profile.hpp"
@@ -8,9 +9,11 @@
 #include <algorithm>
 #include <cctype>
 #include <ctime>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <string>
 
 namespace {
@@ -92,7 +95,8 @@ void printMenu() {
               << "[2] Score a fight from stats\n"
               << "[3] Search fighter profile & Elo history\n"
               << "[4] Backtest model accuracy\n"
-              << "[5] Quit\n"
+              << "[5] Export / save\n"
+              << "[6] Quit\n"
               << "> ";
 }
 
@@ -264,24 +268,26 @@ void showLeaderboard(const ufc::RatingEngine& engine) {
 
 // ---------- profile search ----------
 
-void searchProfile(const ufc::RatingEngine& engine) {
+// Asks for a name, handles multiple matches, and returns the chosen fighter
+// (nullptr if nothing was found or the user cancelled).
+const ufc::Fighter* pickFighter(const ufc::RatingEngine& engine) {
     std::cout << "Search fighter name: ";
     std::string query;
     std::getline(std::cin, query);
     query = trim(query);
-    if (query.empty()) return;
+    if (query.empty()) return nullptr;
 
     const auto matches = engine.search(query);
     if (matches.empty()) {
         std::cout << "No fighters found matching '" << query << "'.\n";
-        return;
+        return nullptr;
     }
 
     constexpr std::size_t kMaxListed = 15;
     if (matches.size() > kMaxListed) {
         std::cout << matches.size() << " fighters match '" << query
                   << "'. Please type more of the name.\n";
-        return;
+        return nullptr;
     }
 
     const ufc::Fighter* chosen = matches.front();
@@ -297,14 +303,21 @@ void searchProfile(const ufc::RatingEngine& engine) {
         const bool digits = !pick.empty() && pick.size() <= 6 &&
                             std::all_of(pick.begin(), pick.end(),
                                         [](unsigned char c) { return std::isdigit(c) != 0; });
-        if (!digits) return;
+        if (!digits) return nullptr;
         const std::size_t index = static_cast<std::size_t>(std::stoi(pick));
         if (index < 1 || index > matches.size()) {
             std::cout << "Invalid selection.\n";
-            return;
+            return nullptr;
         }
         chosen = matches[index - 1];
     }
+
+    return chosen;
+}
+
+void searchProfile(const ufc::RatingEngine& engine) {
+    const ufc::Fighter* chosen = pickFighter(engine);
+    if (!chosen) return;
 
     const auto ranked = ufc::buildLeaderboard(engine);
     std::size_t rank = 0;
@@ -324,6 +337,101 @@ void runBacktestAction(const std::string& csvPath, const ufc::EloConfig& config)
         ufc::runBacktestReport(std::cout, fights, config);
     } catch (const std::exception& e) {
         std::cout << "Error: " << e.what() << "\n";
+    }
+}
+
+// ---------- export / save ----------
+
+const char* const kExportDir = "exports";
+
+// Asks for a file name. Blank = default name. A bare name goes inside exports/,
+// and a missing extension is filled in from the default. Returns "" if cancelled.
+std::string askExportPath(const std::string& defaultName) {
+    std::cout << "File name (blank = " << kExportDir << "/" << defaultName << "): ";
+    std::string name;
+    std::getline(std::cin, name);
+    name = trim(name);
+
+    std::string path;
+    if (name.empty()) {
+        path = std::string(kExportDir) + "/" + defaultName;
+    } else {
+        if (name.find('.') == std::string::npos) {
+            name += defaultName.substr(defaultName.find_last_of('.'));
+        }
+        const bool hasFolder = name.find('/') != std::string::npos ||
+                               name.find('\\') != std::string::npos;
+        path = hasFolder ? name : std::string(kExportDir) + "/" + name;
+    }
+
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec) &&
+        !askYesNo("'" + path + "' already exists. Overwrite?")) {
+        std::cout << "Cancelled.\n";
+        return "";
+    }
+    return path;
+}
+
+void exportLeaderboardAction(const ufc::RatingEngine& engine) {
+    const std::string path = askExportPath("leaderboard.csv");
+    if (path.empty()) return;
+    try {
+        const auto ranked = ufc::buildLeaderboard(engine);
+        ufc::exportLeaderboardCsv(path, ranked);
+        std::cout << "Saved " << ranked.size() << " fighters to " << path << "\n";
+    } catch (const std::exception& e) {
+        std::cout << "Error: could not save: " << e.what() << "\n";
+    }
+}
+
+void exportHistoryAction(const ufc::RatingEngine& engine) {
+    const ufc::Fighter* fighter = pickFighter(engine);
+    if (!fighter) return;
+    const std::string path = askExportPath(ufc::sanitizeFilename(fighter->name) + "_elo_history.csv");
+    if (path.empty()) return;
+    try {
+        ufc::exportFighterHistoryCsv(path, *fighter);
+        std::cout << "Saved " << fighter->history.size() << " fights for " << fighter->name
+                  << " to " << path << "\n";
+    } catch (const std::exception& e) {
+        std::cout << "Error: could not save: " << e.what() << "\n";
+    }
+}
+
+void exportBacktestAction(const std::string& csvPath, const ufc::EloConfig& config) {
+    const std::string path = askExportPath("backtest_report.txt");
+    if (path.empty()) return;
+    try {
+        const auto fights = ufc::loadFightsFromCsv(csvPath);   // includes fights saved this session
+        std::ostringstream report;
+        ufc::runBacktestReport(report, fights, config);
+        ufc::writeTextFile(path, report.str());
+        std::cout << "Saved backtest report to " << path << "\n";
+    } catch (const std::exception& e) {
+        std::cout << "Error: could not save: " << e.what() << "\n";
+    }
+}
+
+void exportMenu(const ufc::RatingEngine& engine, const std::string& csvPath) {
+    std::cout << "\nExport / save:\n"
+              << "  [1] Leaderboard (CSV)\n"
+              << "  [2] A fighter's Elo history (CSV)\n"
+              << "  [3] Backtest report (text file)\n"
+              << "  [4] Back\n"
+              << "> ";
+    std::string choice;
+    if (!std::getline(std::cin, choice)) return;
+    choice = trim(choice);
+
+    if (choice == "1") {
+        exportLeaderboardAction(engine);
+    } else if (choice == "2") {
+        exportHistoryAction(engine);
+    } else if (choice == "3") {
+        exportBacktestAction(csvPath, engine.calculator().config());
+    } else if (choice != "4") {
+        std::cout << "Please choose 1, 2, 3 or 4.\n";
     }
 }
 
@@ -357,9 +465,11 @@ int main(int argc, char* argv[]) {
         } else if (choice == "4") {
             runBacktestAction(path, engine.calculator().config());
         } else if (choice == "5") {
+            exportMenu(engine, path);
+        } else if (choice == "6") {
             break;
         } else {
-            std::cout << "Please choose 1, 2, 3, 4 or 5.\n";
+            std::cout << "Please choose 1, 2, 3, 4, 5 or 6.\n";
         }
     }
     return 0;
