@@ -24,6 +24,10 @@ public:
     // Case-insensitive lookup. Returns nullptr if the fighter is unknown.
     const Fighter* find(const std::string& name) const;
 
+    // Case-insensitive substring search, sorted by name. An exact name match
+    // returns just that fighter.
+    std::vector<const Fighter*> search(const std::string& query) const;
+
     const std::unordered_map<std::string, Fighter>& fighters() const { return fighters_; }
     std::size_t fighterCount() const { return fighters_.size(); }
     const EloCalculator& calculator() const { return calculator_; }
@@ -36,4 +40,4 @@ private:
     std::unordered_map<std::string, Fighter> fighters_; // key = lowercase name
 };
 
-} 
+} // namespace ufc
